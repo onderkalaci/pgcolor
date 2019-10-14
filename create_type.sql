@@ -1,11 +1,17 @@
 
+-- so, let's solve the immediate problem of the case-insensitive
+-- queries and index/constraint utilizations
+-- luckily Postgresql contrib packagaes have an extension
+-- which solves the issue for us: 
+-- CITEXT: https://www.postgresql.org/docs/12/citext.html
+CREATE EXTENSION citext;
 
 
 -- the simplest approach for storing the color information
 -- is to keep the name of the colors
 
 CREATE TABLE colors (
-	color TEXT PRIMARY KEY,
+	color CITEXT PRIMARY KEY,
 	name TEXT
 );
 
@@ -17,10 +23,10 @@ CREATE TABLE palettes (
 	id INT PRIMARY KEY,
 	name TEXT,
 
-	color_1 TEXT REFERENCES colors (color) ON UPDATE CASCADE,
-	color_2 TEXT REFERENCES colors (color) ON UPDATE CASCADE,
-	color_3 TEXT REFERENCES colors (color) ON UPDATE CASCADE,
-	color_4 TEXT REFERENCES colors (color) ON UPDATE CASCADE,
+	color_1 CITEXT REFERENCES colors (color) ON UPDATE CASCADE,
+	color_2 CITEXT REFERENCES colors (color) ON UPDATE CASCADE,
+	color_3 CITEXT REFERENCES colors (color) ON UPDATE CASCADE,
+	color_4 CITEXT REFERENCES colors (color) ON UPDATE CASCADE,
 
 	likes BIGINT
 );
@@ -38,16 +44,24 @@ INSERT INTO colors VALUES
 INSERT INTO palettes VALUES (1, 'OndersPalette', '0xff0000', '0x000000', '0xffffff', '0x0000ff', 0);
 
 
--- oops, we've a problem, the following INSERT will fail
 -- the user/application didn't care much about the case sensitivity 
+-- but, that's already handled for us
 INSERT INTO palettes VALUES (2, 'BuraksPalette', '0xFF0000', '0x000000', '0xFFFFFF', '0x0000FF', 0);
 
--- you can always use store/query using the lower() functions
--- but that'd end up with verbose queries, and also utilizing
--- indexes/constraints also need to consider capitilization
+-- with storing the data as a text of the hex representation of the colors
+-- seems like an incomplete approach because we're losing the color information
+-- on every operation, we'd need to have verbose and error prone queries
 
+-- to give you some insights of what it'd look like
+-- while getting the rgb values
+SELECT
+    name,
+	('x' || substr(color,3,2))::bit(8)::int as r, 
+	('x' || substr(color,5,2))::bit(8)::int as g, 
+	('x' || substr(color,7,2))::bit(8)::int as b 
+FROM 
+	colors; 
 
-
-
-
+-- so, before things get very complicated, let's swith to
+-- a more generic/easy to use represantation for colors
 
