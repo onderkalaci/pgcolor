@@ -173,6 +173,10 @@ char *color_to_str(color *c)
 Datum
 color_eq(PG_FUNCTION_ARGS)
 {
+  color *c1 = PG_GETARG_COLOR(0);
+  color *c2 = PG_GETARG_COLOR(1);
+
+  return c1->r == c2->r && c1->g == c2->g && c1->b == c2->b;
 }
 
 Datum

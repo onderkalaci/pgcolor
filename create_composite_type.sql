@@ -124,19 +124,13 @@ LANGUAGE plpgsql;
 SELECT generate_all_colors(1);
 
 -- find the colors which is pretty close to (255,10,0)
--- oops, this query takes > 6 seconds on my local machine 
+-- oh, now we're safe again, our hard work dropped the
+-- query execution time for this query to a lot more
+-- reasonable times like 600msecs
 SELECT
         count(*)
 FROM
         colors
 WHERE
         color <-> '(255,10,0)' < 15 ;
-
-
--- this is definitely not ideal and applications
--- won't be happy. 
--- what can we do more? Write the function in C!
-
-
-
 
