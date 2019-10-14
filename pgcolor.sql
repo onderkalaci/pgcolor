@@ -27,7 +27,9 @@ CREATE TYPE color (
   INPUT = color_in,
   OUTPUT = color_out,
   RECEIVE = color_recv,
-  SEND = color_send
+  SEND = color_send,
+  internallength = 24
+
 );
 COMMENT ON TYPE color IS 'Color data type for PostgreSQL';
 
