@@ -5,8 +5,14 @@
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
+#include "nodes/extensible.h"
+#include "nodes/readfuncs.h"
+
+
+#define ExtendedNodeName "PgColorExtendedNode"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -21,12 +27,38 @@ typedef struct color
 } color;
 
 
+typedef struct PgColorExtendedNode
+{
+	ExtensibleNode extensible;
+
+	color *interceptedColor;
+} PgColorExtendedNode;
+
+/* Write a Node field */
+#define WRITE_NODE_FIELD(fldname) \
+	(appendStringInfo(str, " :" CppAsString(fldname) " "), \
+	 outNode(str, node->fldname))
+
+#define WRITE_INT_FIELD(fldname) \
+	appendStringInfo(str, " :" CppAsString(fldname) " %d", node->fldname)
+
+#define READ_NODE_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	(void) token;				/* in case not used elsewhere */ \
+	local_node->fldname = nodeRead(NULL, 0)
+
+#define READ_INT_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	token = pg_strtok(&length);		/* get field value */ \
+	local_node->fldname = atoi(token)
+
+
 #define DatumGetColor(X)	 ((color *) DatumGetPointer(X))
 #define ColorGetDatum(X)	 PointerGetDatum(X)
 #define PG_GETARG_COLOR(n)	 DatumGetColor(PG_GETARG_DATUM(n))
 #define PG_RETURN_COLOR(x)	 return ColorGetDatum(x)
 
-static void _PG_init();
+void _PG_init(void);
 static color * color_from_str(char *str);
 static char *color_to_str(color *c);
 
@@ -58,10 +90,71 @@ PG_FUNCTION_INFO_V1(color_ge);
 
 
 
-void
-_PG_init(void)
+static void CopyPgColorExtendedNode(struct ExtensibleNode *target_node, 
+									const struct ExtensibleNode *source_node);
+static bool EqualPgColorExtendedNode(const struct ExtensibleNode *target_node, 
+									 const struct ExtensibleNode *source_node);
+
+static void OutPgColorExtendedNode(struct StringInfoData *str, 
+								    const struct ExtensibleNode *raw_node);
+static void ReadPgColorExtendedNode(struct ExtensibleNode *node);
+
+
+const ExtensibleNodeMethods nodeMethods =
+{.extnodename = ExtendedNodeName,
+ .node_size =  sizeof(PgColorExtendedNode),
+ .nodeCopy = CopyPgColorExtendedNode,
+ .nodeEqual = EqualPgColorExtendedNode,
+ .nodeRead = ReadPgColorExtendedNode,
+ .nodeOut = OutPgColorExtendedNode
+};
+
+static void
+CopyPgColorExtendedNode(struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
+{
+	PgColorExtendedNode *targetPlan = (PgColorExtendedNode *) target_node;
+	PgColorExtendedNode *sourcePlan = (PgColorExtendedNode *) source_node;
+
+	targetPlan->interceptedColor = palloc0(sizeof(color));
+
+	targetPlan->interceptedColor->r = sourcePlan->interceptedColor->r;
+	targetPlan->interceptedColor->g = sourcePlan->interceptedColor->g;
+	targetPlan->interceptedColor->b = sourcePlan->interceptedColor->b;
+}
+
+static bool
+EqualPgColorExtendedNode(const struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
 {
 
+}
+
+static void
+OutPgColorExtendedNode( struct StringInfoData *str, const struct ExtensibleNode *raw_node)
+{
+	const PgColorExtendedNode *node = (const PgColorExtendedNode *) raw_node;
+
+	WRITE_INT_FIELD(interceptedColor->r);
+	WRITE_INT_FIELD(interceptedColor->g);
+	WRITE_INT_FIELD(interceptedColor->b);
+}
+
+
+static void
+ReadPgColorExtendedNode(struct ExtensibleNode *node)
+{
+	PgColorExtendedNode *local_node = (PgColorExtendedNode *) node;
+	const char		*token;
+	int			length;
+
+	READ_INT_FIELD(interceptedColor->r);
+	READ_INT_FIELD(interceptedColor->g);
+	READ_INT_FIELD(interceptedColor->b);
+}
+
+ void
+_PG_init(void)
+{
+	RegisterExtensibleNodeMethods(&nodeMethods);
 }
 
 
@@ -116,7 +209,24 @@ rgb_distance(PG_FUNCTION_ARGS)
   color *c1 = (color *) PG_GETARG_COLOR(0);
   color *c2 = (color *) PG_GETARG_COLOR(1);
 
+  if (log_min_messages <= DEBUG4 || 
+      client_min_messages <= DEBUG4)
+  {
+  	PgColorExtendedNode *extendedNode1 = palloc(sizeof(PgColorExtendedNode));
+  	PgColorExtendedNode *extendedNode2 = palloc(sizeof(PgColorExtendedNode));
 
+  	extendedNode1->extensible.extnodename = ExtendedNodeName;
+  	extendedNode1->extensible.type = T_ExtensibleNode;
+  	extendedNode1->interceptedColor = c1;
+
+  	extendedNode2->extensible.extnodename = ExtendedNodeName;
+  	extendedNode2->extensible.type = T_ExtensibleNode;
+  	extendedNode2->interceptedColor = c2;
+	
+  	elog(DEBUG4, "left arg:  %s", nodeToString(extendedNode1));
+  	elog(DEBUG4, "right arg: %s", nodeToString(extendedNode2));
+  	elog(DEBUG4, "left arg and right are equal: %d", equal(extendedNode1, extendedNode2));
+  }
   double d1 = (double)c1->r - c2->r;
   double d2 = (double)c1->g - c2->g;
   double d3 = (double)c1->b - c2->b;
