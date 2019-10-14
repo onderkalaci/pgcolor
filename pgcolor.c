@@ -35,13 +35,28 @@ Datum color_out(PG_FUNCTION_ARGS);
 Datum color_recv(PG_FUNCTION_ARGS);
 Datum color_send(PG_FUNCTION_ARGS);
 Datum rgb_distance(PG_FUNCTION_ARGS);
-
+Datum color_eq(PG_FUNCTION_ARGS);
+Datum color_ne(PG_FUNCTION_ARGS);
+Datum color_cmp(PG_FUNCTION_ARGS);
+Datum color_lt(PG_FUNCTION_ARGS);
+Datum color_le(PG_FUNCTION_ARGS);
+Datum color_gt(PG_FUNCTION_ARGS);
+Datum color_ge(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(color_in);
 PG_FUNCTION_INFO_V1(color_out);
 PG_FUNCTION_INFO_V1(color_recv);
 PG_FUNCTION_INFO_V1(color_send);
 PG_FUNCTION_INFO_V1(rgb_distance);
+PG_FUNCTION_INFO_V1(color_eq);
+PG_FUNCTION_INFO_V1(color_ne);
+PG_FUNCTION_INFO_V1(color_cmp);
+PG_FUNCTION_INFO_V1(color_lt);
+PG_FUNCTION_INFO_V1(color_le);
+PG_FUNCTION_INFO_V1(color_gt);
+PG_FUNCTION_INFO_V1(color_ge);
+
+
 
 void
 _PG_init(void)
@@ -153,4 +168,146 @@ char *color_to_str(color *c)
 	char *s = psprintf("(%d,%d,%d)", c->r, c->g, c->b);
  	
 	return s;
+}
+
+Datum
+color_eq(PG_FUNCTION_ARGS)
+{
+}
+
+Datum
+color_ne(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  return c1->r != c2->r || c1->g != c2->g || c1->b != c2->b;
+}
+
+Datum
+color_cmp(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  if (c1 == NULL)
+	  return 1;
+
+  if (c2 == NULL)
+	  return -1;
+
+  if (c1->r > c2->r)
+	  return 1;
+  else  if (c1->r < c2->r)
+	  return -1;
+
+  if (c1->g > c2->g)
+	  return 1;
+  else  if (c1->g < c2->g)
+	  return -1;
+
+  if (c1->b > c2->b)
+	  return 1;
+  else  if (c1->b < c2->b)
+	  return -1;
+
+  return 0;
+}
+
+
+Datum
+color_lt(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  if (c1->r < c2->r)
+	  return 1;
+  else if (c1->r > c2->r)
+	  return 0;
+
+  if (c1->g < c2->g)
+	  return 1;
+  else if (c1->g > c2->g)
+	  return 0;
+
+  if (c1->b < c2->b)
+	  return 1;
+  else if (c1->b > c2->b)
+	  return 0;
+
+  return 0;
+}
+
+
+Datum
+color_le(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  if (c1->r < c2->r)
+	  return 1;
+  else if (c1->r > c2->r)
+	  return 0;
+
+  if (c1->g < c2->g)
+	  return 1;
+  else if (c1->g > c2->g)
+	  return 0;
+
+  if (c1->b < c2->b)
+	  return 1;
+  else if (c1->b > c2->b)
+	  return 0;
+
+  return 1;
+}
+
+Datum
+color_gt(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  if (c1->r > c2->r)
+	  return 1;
+  else if (c1->r < c2->r)
+	  return 0;
+
+  if (c1->g > c2->g)
+	  return 1;
+  else if (c1->g < c2->g)
+	  return 0;
+
+  if (c1->b > c2->b)
+	  return 1;
+  else if (c1->b < c2->b)
+	  return 0;
+
+	 return 0;
+}
+
+Datum
+color_ge(PG_FUNCTION_ARGS)
+{
+  color *c1 = (color *) PG_GETARG_COLOR(0);
+  color *c2 = (color *) PG_GETARG_COLOR(1);
+
+  if (c1->r > c2->r)
+	  return 1;
+  else if (c1->r < c2->r)
+	  return 0;
+
+  if (c1->g > c2->g)
+	  return 1;
+  else if (c1->g < c2->g)
+	  return 0;
+
+  if (c1->b > c2->b)
+	  return 1;
+  else if (c1->b < c2->b)
+	return 0;
+
+	 return 1;
 }
