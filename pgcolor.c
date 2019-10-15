@@ -1,6 +1,9 @@
 
 #include "postgres.h"
 #include "miscadmin.h"
+#include "funcapi.h"
+
+#include <unistd.h>
 
 #include "catalog/pg_type.h"
 #include "utils/elog.h"
@@ -8,6 +11,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/syscache.h"
+#include "utils/hashutils.h"
 #include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/extensible.h"
@@ -16,6 +20,11 @@
 #include "optimizer/planner.h"
 #include "executor/tstoreReceiver.h"
 #include "utils/snapmgr.h"
+#include "catalog/namespace.h"
+#include "executor/executor.h"
+#include "utils/builtins.h"
+#include "utils/regproc.h"
+#include "storage/ipc.h"
 
 #define ExtendedNodeName "PgColorExtendedNode"
 
@@ -158,6 +167,112 @@ static CustomExecMethods PgColorCustomExecMethods = {
 	.ReScanCustomScan = PgColorReScan,
 };
 
+static void ColorQueryStatsExecutorsEntry(uint64 queryId, color *color);
+static void InitializeColorQueryStats(void);
+static void ColorQueryStatsShmemStartup(void);
+static void InitializeColorQueryStats(void);
+static HTAB * BuildExistingQueryIdHash(void);
+static void ColorQueryStatsRemoveExpiredEntries(HTAB *existingQueryIdHash);
+static void ColorQueryStatsSynchronizeEntries(void);
+static Tuplestorestate * SetupTuplestore(FunctionCallInfo fcinfo, TupleDesc *tupleDescriptor);
+static ReturnSetInfo * CheckTuplestoreReturn(FunctionCallInfo fcinfo, TupleDesc *tupdesc);
+static int GetPGColorStatsMax(void);
+static ReturnSetInfo * FunctionCallGetTupleStore1(PGFunction function, Oid functionId, Datum argument);
+static Oid
+FunctionOidExtended(const char *schemaName, const char *functionName, int argumentCount,
+                                        bool missingOK);
+
+#define fcSetArg(fc, n, argval) \
+	(((fc)->args[n].isnull = false), ((fc)->args[n].value = (argval)))
+
+#define COLOR_STATS_DUMP_FILE "pg_stat/color_query_stats.stat"
+#define COLOR_STAT_STATEMENTS_COLS 6
+#define COLOR_STAT_STATAMENTS_QUERY_ID 0
+#define COLOR_STAT_STATAMENTS_USER_ID 1
+#define COLOR_STAT_STATAMENTS_DB_ID 2
+#define COLOR_STAT_STATAMENTS_COLOR 3
+#define COLOR_STAT_STATAMENTS_CALLS 4
+
+
+#define USAGE_DECREASE_FACTOR (0.99)    /* decreased every ColorQueryStatsEntryDealloc */
+#define STICKY_DECREASE_FACTOR (0.50)   /* factor for sticky entries */
+#define USAGE_DEALLOC_PERCENT 5         /* free this % of entries at once */
+#define USAGE_INIT (1.0)                /* including initial planning */
+#define STATS_SHARED_MEM_NAME "color_query_stats"
+
+#define MAX_KEY_LENGTH NAMEDATALEN
+
+/* Magic number identifying the stats file format */
+static const uint32 COLOR_QUERY_STATS_FILE_HEADER = 0x0e756e0f;
+
+/* TODO: maximum number of entries in queryStats hash, should controlled by GUC pgcolor.stat_statements_max */
+int ColorStatsMax = 50000;
+
+/*
+ * Hashtable key that defines the identity of a hashtable entry.  We use the
+ * same hash as pg_stat_statements
+ */
+typedef struct QueryStatsHashKey
+{
+	Oid userid;                     /* user OID */
+	Oid dbid;                       /* database OID */
+	uint64 queryid;                 /* query identifier */
+	char color[MAX_KEY_LENGTH];
+} QueryStatsHashKey;
+
+/*
+ * Statistics per query and executor type
+ */
+typedef struct queryStatsEntry
+{
+	QueryStatsHashKey key;   /* hash key of entry - MUST BE FIRST */
+	int64 calls;       /* # of times executed */
+	double usage;      /* hashtable usage factor */
+	slock_t mutex;     /* protects the counters only */
+} QueryStatsEntry;
+
+/*
+ * Global shared state
+ */
+typedef struct QueryStatsSharedState
+{
+	LWLockId lock;                      /* protects hashtable search/modification */
+	double cur_median_usage;            /* current median usage in hashtable */
+} QueryStatsSharedState;
+
+/* lookup table for existing pg_stat_statements entries */
+typedef struct ExistingStatsHashKey
+{
+	Oid userid;                     /* user OID */
+	Oid dbid;                       /* database OID */
+	uint64 queryid;                 /* query identifier */
+} ExistingStatsHashKey;
+
+/* saved hook address in case of unload */
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/* Links to shared memory state */
+static QueryStatsSharedState *queryStats = NULL;
+static HTAB *queryStatsHash = NULL;
+
+/*--- Functions --- */
+
+Datum color_query_stats(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(color_query_stats);
+PG_FUNCTION_INFO_V1(color_stat_statements_reset);
+
+static Size ColorQueryStatsSharedMemSize(void);
+
+static void ColorQueryStatsShmemStartup(void);
+static void ColorQueryStatsShmemShutdown(int code, Datum arg);
+static QueryStatsEntry * ColorQueryStatsEntryAlloc(QueryStatsHashKey *key, bool sticky);
+static void ColorQueryStatsEntryDealloc(void);
+static void ColorQueryStatsEntryReset(void);
+static uint32 ColorQuerysStatsHashFn(const void *key, Size keysize);
+static int ColorQuerysStatsMatchFn(const void *key1, const void *key2, Size keysize);
+static uint32 ExistingStatsHashFn(const void *key, Size keysize);
+static int ExistingStatsMatchFn(const void *key1, const void *key2, Size keysize);
 static void
 CopyPgColorExtendedNode(struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
 {
@@ -211,7 +326,21 @@ _PG_init(void)
 	RegisterExtensibleNodeMethods(&nodeMethods);
 
 	planner_hook = pg_color_planner;
+	
+	InitializeColorQueryStats();
+}
 
+static void
+InitializeColorQueryStats(void)
+{
+	RequestAddinShmemSpace(ColorQueryStatsSharedMemSize());
+
+	elog(LOG, "requesting named LWLockTranch for %s", STATS_SHARED_MEM_NAME);
+	RequestNamedLWLockTranche(STATS_SHARED_MEM_NAME, 1);
+
+	/* Install hook */
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = ColorQueryStatsShmemStartup;
 }
 
 static PlannedStmt *
@@ -712,9 +841,11 @@ PgColorEndScan(CustomScanState *node)
           client_min_messages <= DEBUG4)
         {
                 elog(DEBUG4, "Executor intercepted the color %s", nodeToString(scanState->color));
-        }
 
+	}
 
+	
+        	ColorQueryStatsExecutorsEntry(scanState->queryId, scanState->color->interceptedColor);
 	
 }
 
@@ -868,4 +999,982 @@ static EState *
 ScanStateGetExecutorState(PgColorScanState *scanState)
 {
 	return scanState->customScanState.ss.ps.state;
+}
+
+
+void
+ColorQueryStatsExecutorsEntry(uint64 queryId, color *color)
+{
+	volatile QueryStatsEntry *e;
+
+	QueryStatsHashKey key;
+	QueryStatsEntry *entry;
+
+	/* Safety check... */
+	if (!queryStats || !queryStatsHash)
+	{
+		return;
+	}
+
+	/* Set up key for hashtable search */
+	key.userid = GetUserId();
+	key.dbid = MyDatabaseId;
+	key.queryid = queryId;
+	memset(key.color, 0, MAX_KEY_LENGTH);
+	if (color != NULL)
+	{
+		StringInfo str = makeStringInfo();
+
+		appendStringInfo(str, "(%d,%d,%d)", color->r, color->g, color->b);
+
+		strlcpy(key.color, str->data, MAX_KEY_LENGTH);
+	}
+
+	/* Lookup the hash table entry with shared lock. */
+	LWLockAcquire(queryStats->lock, LW_SHARED);
+
+	entry = (QueryStatsEntry *) hash_search(queryStatsHash, &key, HASH_FIND, NULL);
+
+	/* Create new entry, if not present */
+	if (!entry)
+	{
+		/* Need exclusive lock to make a new hashtable entry - promote */
+		LWLockRelease(queryStats->lock);
+		LWLockAcquire(queryStats->lock, LW_EXCLUSIVE);
+
+		/* OK to create a new hashtable entry */
+		entry = ColorQueryStatsEntryAlloc(&key, false);
+	}
+
+	/*
+	 * Grab the spinlock while updating the counters (see comment about
+	 * locking rules at the head of the pg_stat_statements file)
+	 */
+	e = (volatile QueryStatsEntry *) entry;
+
+	SpinLockAcquire(&e->mutex);
+
+	/* "Unstick" entry if it was previously sticky */
+	if (e->calls == 0)
+	{
+		e->usage = USAGE_INIT;
+	}
+
+	e->calls += 1;
+
+	SpinLockRelease(&e->mutex);
+
+	LWLockRelease(queryStats->lock);
+}
+
+static void
+ColorQueryStatsShmemStartup(void)
+{
+	bool found;
+	HASHCTL info;
+	FILE *file;
+	int i;
+	uint32 header;
+	int32 num;
+	QueryStatsEntry *buffer = NULL;
+
+	if (prev_shmem_startup_hook)
+	{
+		prev_shmem_startup_hook();
+	}
+
+	/* Create or attach to the shared memory state */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	/* global access lock */
+	queryStats = ShmemInitStruct(STATS_SHARED_MEM_NAME,
+								 sizeof(QueryStatsSharedState),
+								 &found);
+
+	if (!found)
+	{
+		/* First time through ... */
+		queryStats->lock = &(GetNamedLWLockTranche(STATS_SHARED_MEM_NAME))->lock;
+	}
+
+	memset(&info, 0, sizeof(info));
+	info.keysize = sizeof(QueryStatsHashKey);
+	info.entrysize = sizeof(QueryStatsEntry);
+	info.hash = ColorQuerysStatsHashFn;
+	info.match = ColorQuerysStatsMatchFn;
+
+	/* allocate stats shared memory hash */
+	queryStatsHash = ShmemInitHash("color_query_stats hash",
+								   ColorStatsMax, ColorStatsMax,
+								   &info,
+								   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+
+	LWLockRelease(AddinShmemInitLock);
+
+	if (!IsUnderPostmaster)
+	{
+		on_shmem_exit(ColorQueryStatsShmemShutdown, (Datum) 0);
+	}
+
+	/*
+	 * Done if some other process already completed our initialization.
+	 */
+	if (found)
+	{
+		return;
+	}
+
+	/* Load stat file, don't care about locking */
+	file = AllocateFile(COLOR_STATS_DUMP_FILE, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno == ENOENT)
+		{
+			return;         /* ignore not-found error */
+		}
+		goto error;
+	}
+
+	/* check is header is valid */
+	if (fread(&header, sizeof(uint32), 1, file) != 1 ||
+		header != COLOR_QUERY_STATS_FILE_HEADER)
+	{
+		goto error;
+	}
+
+	/* get number of entries */
+	if (fread(&num, sizeof(int32), 1, file) != 1)
+	{
+		goto error;
+	}
+
+	for (i = 0; i < num; i++)
+	{
+		QueryStatsEntry temp;
+		QueryStatsEntry *entry;
+
+		if (fread(&temp, sizeof(QueryStatsEntry), 1, file) != 1)
+		{
+			goto error;
+		}
+
+		/* Skip loading "sticky" entries */
+		if (temp.calls == 0)
+		{
+			continue;
+		}
+
+		entry = ColorQueryStatsEntryAlloc(&temp.key, false);
+
+		/* copy in the actual stats */
+		entry->calls = temp.calls;
+		entry->usage = temp.usage;
+
+		/* don't initialize spinlock, already done */
+	}
+
+	FreeFile(file);
+
+	/*
+	 * Remove the file so it's not included in backups/replication slaves,
+	 * etc. A new file will be written on next shutdown.
+	 */
+	unlink(COLOR_STATS_DUMP_FILE);
+
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not read color_query_stats file \"%s\": %m",
+					COLOR_STATS_DUMP_FILE)));
+	if (buffer)
+	{
+		pfree(buffer);
+	}
+	if (file)
+	{
+		FreeFile(file);
+	}
+
+	/* delete bogus file, don't care of errors in this case */
+	unlink(COLOR_STATS_DUMP_FILE);
+}
+
+/*
+ * Allocate a new hashtable entry.
+ * caller must hold an exclusive lock on queryStats->lock
+ */
+static QueryStatsEntry *
+ColorQueryStatsEntryAlloc(QueryStatsHashKey *key, bool sticky)
+{
+	QueryStatsEntry *entry;
+	bool found;
+
+	/* Make space if needed */
+	while (hash_get_num_entries(queryStatsHash) >= ColorStatsMax)
+	{
+		ColorQueryStatsEntryDealloc();
+	}
+
+	/* Find or create an entry with desired hash code */
+	entry = (QueryStatsEntry *) hash_search(queryStatsHash, key, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		/* New entry, initialize it */
+
+		/* set the appropriate initial usage count */
+		entry->usage = sticky ? queryStats->cur_median_usage : USAGE_INIT;
+
+		/* re-initialize the mutex each time ... we assume no one using it */
+		SpinLockInit(&entry->mutex);
+	}
+
+	entry->calls = 0;
+	entry->usage = (0.0);
+
+	return entry;
+}
+
+
+/*
+ * entry_cmp is qsort comparator for sorting into increasing usage order
+ */
+static int
+entry_cmp(const void *lhs, const void *rhs)
+{
+	double l_usage = (*(QueryStatsEntry *const *) lhs)->usage;
+	double r_usage = (*(QueryStatsEntry *const *) rhs)->usage;
+
+	if (l_usage < r_usage)
+	{
+		return -1;
+	}
+	else if (l_usage > r_usage)
+	{
+		return +1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*
+ * ColorQueryStatsEntryDealloc deallocates least used entries.
+ * Caller must hold an exclusive lock on queryStats->lock.
+ */
+static void
+ColorQueryStatsEntryDealloc(void)
+{
+	HASH_SEQ_STATUS hash_seq;
+	QueryStatsEntry **entries;
+	QueryStatsEntry *entry;
+	int nvictims;
+	int i;
+
+	/*
+	 * Sort entries by usage and deallocate USAGE_DEALLOC_PERCENT of them.
+	 * While we're scanning the table, apply the decay factor to the usage
+	 * values.
+	 */
+	entries = palloc(hash_get_num_entries(queryStatsHash) * sizeof(QueryStatsEntry *));
+
+	i = 0;
+	hash_seq_init(&hash_seq, queryStatsHash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		entries[i++] = entry;
+
+		/* "Sticky" entries get a different usage decay rate. */
+		if (entry->calls == 0)
+		{
+			entry->usage *= STICKY_DECREASE_FACTOR;
+		}
+		else
+		{
+			entry->usage *= USAGE_DECREASE_FACTOR;
+		}
+	}
+
+	qsort(entries, i, sizeof(QueryStatsEntry *), entry_cmp);
+
+	if (i > 0)
+	{
+		/* Record the (approximate) median usage */
+		queryStats->cur_median_usage = entries[i / 2]->usage;
+	}
+
+	nvictims = Max(10, i * USAGE_DEALLOC_PERCENT / 100);
+	nvictims = Min(nvictims, i);
+
+	for (i = 0; i < nvictims; i++)
+	{
+		hash_search(queryStatsHash, &entries[i]->key, HASH_REMOVE, NULL);
+	}
+
+	pfree(entries);
+}
+
+
+/*
+ */
+static void
+ColorQueryStatsEntryReset(void)
+{
+	HASH_SEQ_STATUS hash_seq;
+	QueryStatsEntry *entry;
+
+	LWLockAcquire(queryStats->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&hash_seq, queryStatsHash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		hash_search(queryStatsHash, &entry->key, HASH_REMOVE, NULL);
+	}
+
+	LWLockRelease(queryStats->lock);
+}
+
+
+/*
+ */
+#include "catalog/pg_collation.h"
+static uint32
+ColorQuerysStatsHashFn(const void *key, Size keysize)
+{
+	const QueryStatsHashKey *k = (const QueryStatsHashKey *) key;
+
+	if (k->color[0] != '\0')
+	{
+		//Datum colorHash  = DirectFunctionCall1Coll(hashtext, DEFAULT_COLLATION_OID, CStringGetDatum(k->color));
+
+		return hash_uint32((uint32) k->userid) ^
+			   hash_uint32((uint32) k->dbid) ^
+			   hash_any((const unsigned char *) &(k->queryid), sizeof(uint64));
+
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*
+ * ColorQuerysStatsMatchFn compares two keys - zero means match.
+ * See definition of HashCompareFunc in hsearch.h for more info.
+ */
+static int
+ColorQuerysStatsMatchFn(const void *key1, const void *key2, Size keysize)
+{
+	const QueryStatsHashKey *k1 = (const QueryStatsHashKey *) key1;
+	const QueryStatsHashKey *k2 = (const QueryStatsHashKey *) key2;
+
+	if (k1->userid == k2->userid &&
+		k1->dbid == k2->dbid &&
+		k1->queryid == k2->queryid &&
+		strncmp(k1->color, k2->color, 256) == 0)
+	{
+		return 0;
+	}
+	else
+	{
+		return 1;
+	}
+}
+
+
+/*
+ * ExistingStatsHashFn calculates and returns hash value for ExistingStatsHashKey
+ */
+static uint32
+ExistingStatsHashFn(const void *key, Size keysize)
+{
+	const ExistingStatsHashKey *k = (const ExistingStatsHashKey *) key;
+
+	return hash_uint32((uint32) k->userid) ^
+		   hash_uint32((uint32) k->dbid) ^
+		   hash_any((const unsigned char *) &(k->queryid), sizeof(uint64));
+}
+
+
+/*
+ * ExistingStatsMatchFn compares two keys of type ExistingStatsHashKey - zero
+ * means match. See definition of HashCompareFunc in hsearch.h for more info.
+ */
+static int
+ExistingStatsMatchFn(const void *key1, const void *key2, Size keysize)
+{
+	const ExistingStatsHashKey *k1 = (const ExistingStatsHashKey *) key1;
+	const ExistingStatsHashKey *k2 = (const ExistingStatsHashKey *) key2;
+
+
+	if (k1->userid == k2->userid &&
+		k1->dbid == k2->dbid &&
+		k1->queryid == k2->queryid)
+	{
+		return 0;
+	}
+
+	return 1;
+}
+
+
+/*
+ * Reset statistics.
+ */
+Datum
+color_stat_statements_reset(PG_FUNCTION_ARGS)
+{
+	ColorQueryStatsEntryReset();
+	PG_RETURN_VOID();
+}
+
+/*
+ * ColorQueryStatsSynchronizeEntries removes all entries in queryStats hash
+ * that does not have matching queryId in pg_stat_statements.
+ *
+ * A function called inside (ColorQueryStatsRemoveExpiredEntries) acquires
+ * an exclusive lock on queryStats->lock.
+ */
+static void
+ColorQueryStatsSynchronizeEntries(void)
+{
+	HTAB *existingQueryIdHash = BuildExistingQueryIdHash();
+	if (existingQueryIdHash != NULL)
+	{
+		ColorQueryStatsRemoveExpiredEntries(existingQueryIdHash);
+		hash_destroy(existingQueryIdHash);
+	}
+}
+
+
+
+/*
+ * color_query_stats returns query stats kept in memory.
+ */
+Datum
+color_query_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc tupdesc;
+	Tuplestorestate *tupstore;
+	HASH_SEQ_STATUS hash_seq;
+	QueryStatsEntry *entry;
+	Oid currentUserId = GetUserId();
+	bool canSeeStats = superuser();
+
+	if (!queryStats)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("color_query_stats: shared memory not initialized")));
+	}
+
+	tupstore = SetupTuplestore(fcinfo, &tupdesc);
+
+
+	/* exclusive lock on queryStats->lock is acquired and released inside the function */
+	ColorQueryStatsSynchronizeEntries();
+
+	LWLockAcquire(queryStats->lock, LW_SHARED);
+
+	hash_seq_init(&hash_seq, queryStatsHash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		Datum values[COLOR_STAT_STATEMENTS_COLS];
+		bool nulls[COLOR_STAT_STATEMENTS_COLS];
+
+		/* following vars are to keep data for processing after spinlock release */
+		uint64 queryid = 0;
+		Oid userid = InvalidOid;
+		Oid dbid = InvalidOid;
+		char color[MAX_KEY_LENGTH];
+		int64 calls = 0;
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+		memset(color, 0, MAX_KEY_LENGTH);
+
+		SpinLockAcquire(&entry->mutex);
+
+		/*
+		 * Skip entry if unexecuted (ie, it's a pending "sticky" entry) or
+		 * the user does not have permission to view it.
+		 */
+		if (entry->calls == 0 || !(currentUserId == entry->key.userid || canSeeStats))
+		{
+			SpinLockRelease(&entry->mutex);
+			continue;
+		}
+
+		queryid = entry->key.queryid;
+		userid = entry->key.userid;
+		dbid = entry->key.dbid;
+
+		memcpy(color, entry->key.color, MAX_KEY_LENGTH);
+
+		calls = entry->calls;
+
+		SpinLockRelease(&entry->mutex);
+
+		values[COLOR_STAT_STATAMENTS_QUERY_ID] = UInt64GetDatum(queryid);
+		values[COLOR_STAT_STATAMENTS_USER_ID] = ObjectIdGetDatum(userid);
+		values[COLOR_STAT_STATAMENTS_DB_ID] = ObjectIdGetDatum(dbid);
+
+		if (color[0] != '\0')
+		{
+			values[COLOR_STAT_STATAMENTS_COLOR] = CStringGetTextDatum(
+				color);
+		}
+		else
+		{
+			nulls[COLOR_STAT_STATAMENTS_COLOR] = true;
+		}
+
+		values[COLOR_STAT_STATAMENTS_CALLS] = Int64GetDatumFast(calls);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	LWLockRelease(queryStats->lock);
+
+	/* clean up and return the tuplestore */
+	tuplestore_donestoring(tupstore);
+
+	return (Datum) 0;
+}
+
+static Tuplestorestate *
+SetupTuplestore(FunctionCallInfo fcinfo, TupleDesc *tupleDescriptor)
+{
+	ReturnSetInfo *resultSet = CheckTuplestoreReturn(fcinfo, tupleDescriptor);
+	MemoryContext perQueryContext = resultSet->econtext->ecxt_per_query_memory;
+
+	MemoryContext oldContext = MemoryContextSwitchTo(perQueryContext);
+	Tuplestorestate *tupstore = tuplestore_begin_heap(true, false, work_mem);
+	resultSet->returnMode = SFRM_Materialize;
+	resultSet->setResult = tupstore;
+	resultSet->setDesc = *tupleDescriptor;
+	MemoryContextSwitchTo(oldContext);
+
+	return tupstore;
+}
+
+/*
+ * CheckTuplestoreReturn checks if a tuplestore can be returned in the callsite
+ * of the UDF.
+ */
+static ReturnSetInfo *
+CheckTuplestoreReturn(FunctionCallInfo fcinfo, TupleDesc *tupdesc)
+{
+	ReturnSetInfo *returnSetInfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (returnSetInfo == NULL || !IsA(returnSetInfo, ReturnSetInfo))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot " \
+						"accept a set")));
+	}
+	if (!(returnSetInfo->allowedModes & SFRM_Materialize))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not " \
+						"allowed in this context")));
+	}
+	switch (get_call_result_type(fcinfo, NULL, tupdesc))
+	{
+		case TYPEFUNC_COMPOSITE:
+		{
+			/* success */
+			break;
+		}
+
+		case TYPEFUNC_RECORD:
+		{
+			/* failed to determine actual type of RECORD */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+			break;
+		}
+
+		default:
+		{
+			/* result type isn't composite */
+			elog(ERROR, "return type must be a row type");
+			break;
+		}
+	}
+	return returnSetInfo;
+}
+
+
+
+
+/*
+ * BuildExistingQueryIdHash goes over entries in pg_stat_statements and prepare
+ * a hash table of queryId's. The function returns null if
+ * public.pg_stat_statements(bool) function is not available. Returned hash
+ * table is allocated on the CurrentMemoryContext, and caller is responsible
+ * for deallocation.
+ */
+static HTAB *
+BuildExistingQueryIdHash(void)
+{
+	HTAB *queryIdHashTable = NULL;
+	const int userIdAttributeNumber = 1;
+	const int dbIdAttributeNumber = 2;
+	const int queryIdAttributeNumber = 3;
+	FmgrInfo *fmgrPGStatStatements = NULL;
+	ReturnSetInfo *statStatementsReturnSet = NULL;
+	TupleTableSlot *tupleTableSlot = NULL;
+	Datum commandTypeDatum = (Datum) 0;
+	HASHCTL info;
+	int hashFlags = 0;
+	int pgColorStatsMax = 0;
+	bool missingOK = true;
+
+	Oid pgStatStatementsOid = FunctionOidExtended("public", "pg_stat_statements", 1,
+												  missingOK);
+	if (!OidIsValid(pgStatStatementsOid))
+	{
+		return NULL;
+	}
+
+	/* fetch pg_stat_statements.max, it is expected to be available, if not bail out */
+	pgColorStatsMax = GetPGColorStatsMax();
+	if (pgColorStatsMax == 0)
+	{
+		ereport(DEBUG1, (errmsg("Cannot access pg_stat_statements.max")));
+		return NULL;
+	}
+
+	fmgrPGStatStatements = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+	commandTypeDatum = BoolGetDatum(false);
+
+	fmgr_info(pgStatStatementsOid, fmgrPGStatStatements);
+
+	statStatementsReturnSet = FunctionCallGetTupleStore1(fmgrPGStatStatements->fn_addr,
+														 pgStatStatementsOid,
+														 commandTypeDatum);
+	tupleTableSlot = MakeSingleTupleTableSlot(statStatementsReturnSet->setDesc,
+													&TTSOpsMinimalTuple);
+
+	info.keysize = sizeof(ExistingStatsHashKey);
+	info.entrysize = sizeof(ExistingStatsHashKey);
+	info.hcxt = CurrentMemoryContext;
+	info.hash = ExistingStatsHashFn;
+	info.match = ExistingStatsMatchFn;
+
+	hashFlags = (HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION | HASH_COMPARE);
+
+	/*
+	 * Allocate more hash slots (twice as much) than necessary to minimize
+	 * collisions.
+	 */
+	queryIdHashTable = hash_create("pg_stats_statements queryId hash",
+								   pgColorStatsMax * 2, &info, hashFlags);
+
+	/* iterate over tuples in tuple store, and add queryIds to hash table */
+	while (true)
+	{
+		bool tuplePresent = false;
+		bool isNull = false;
+		Datum queryIdDatum = 0;
+		Datum dbIdDatum = 0;
+		Datum userIdDatum = 0;
+
+		tuplePresent = tuplestore_gettupleslot(statStatementsReturnSet->setResult,
+											   true,
+											   false,
+											   tupleTableSlot);
+
+		if (!tuplePresent)
+		{
+			break;
+		}
+
+		userIdDatum = slot_getattr(tupleTableSlot, userIdAttributeNumber, &isNull);
+		dbIdDatum = slot_getattr(tupleTableSlot, dbIdAttributeNumber, &isNull);
+		queryIdDatum = slot_getattr(tupleTableSlot, queryIdAttributeNumber, &isNull);
+
+		/*
+		 * queryId may be returned as NULL when current user is not authorized to see other
+		 * users' stats.
+		 */
+		if (!isNull)
+		{
+			ExistingStatsHashKey key;
+			key.userid = DatumGetInt32(userIdDatum);
+			key.dbid = DatumGetInt32(dbIdDatum);
+			key.queryid = DatumGetInt64(queryIdDatum);
+
+			hash_search(queryIdHashTable, (void *) &key, HASH_ENTER, NULL);
+		}
+
+		ExecClearTuple(tupleTableSlot);
+	}
+
+	ExecDropSingleTupleTableSlot(tupleTableSlot);
+
+	tuplestore_end(statStatementsReturnSet->setResult);
+
+	pfree(fmgrPGStatStatements);
+
+	return queryIdHashTable;
+}
+
+
+/*
+ * GetPGColorStatsMax returns GUC value pg_stat_statements.max. The
+ * function returns 0 if for some reason it can not access
+ * pg_stat_statements.max value.
+ */
+static int
+GetPGColorStatsMax(void)
+{
+	const char *pgssMax;
+	const char *name = "pg_stat_statements.max";
+	int maxValue = 0;
+
+	pgssMax = GetConfigOption(name, true, false);
+
+	/*
+	 * Retrieving pg_stat_statements.max can fail if the extension is loaded
+	 * after pgcolor in shared_preload_libraries, or not at all.
+	 */
+	if (pgssMax)
+	{
+		maxValue = pg_atoi(pgssMax, 4, 0);
+	}
+
+	return maxValue;
+}
+
+
+/*
+ * ColorQueryStatsRemoveExpiredEntries iterates over queryStats hash entries
+ * and removes entries with keys that do not exists in the provided hash of
+ * queryIds.
+ *
+ * Acquires and releases exclusive lock on queryStats->lock.
+ */
+static void
+ColorQueryStatsRemoveExpiredEntries(HTAB *existingQueryIdHash)
+{
+	HASH_SEQ_STATUS hash_seq;
+	QueryStatsEntry *entry;
+	int removedCount = 0;
+	bool canSeeStats = superuser();
+	Oid currentUserId = GetUserId();
+
+
+	LWLockAcquire(queryStats->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&hash_seq, queryStatsHash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		bool found = false;
+		ExistingStatsHashKey existingStatsKey = { 0, 0, 0 };
+
+		/*
+		 * pg_stat_statements returns NULL in the queryId field for queries
+		 * belonging to other users. Those queries are therefore not reflected
+		 * in the existingQueryIdHash, but that does not mean that we should
+		 * remove them as they are relevant to other users.
+		 */
+		if (!(currentUserId == entry->key.userid || canSeeStats))
+		{
+			continue;
+		}
+
+		existingStatsKey.userid = entry->key.userid;
+		existingStatsKey.dbid = entry->key.dbid;
+		existingStatsKey.queryid = entry->key.queryid;
+
+		hash_search(existingQueryIdHash, (void *) &existingStatsKey, HASH_FIND, &found);
+		if (!found)
+		{
+			hash_search(queryStatsHash, &entry->key, HASH_REMOVE, NULL);
+			removedCount++;
+		}
+	}
+
+	LWLockRelease(queryStats->lock);
+
+	if (removedCount > 0)
+	{
+		elog(DEBUG2, "color_stat_statements removed %d expired entries", removedCount);
+	}
+}
+
+/*
+ * FunctionOidExtended searches for a given function identified by schema,
+ * functionName, and argumentCount. It reports error if the function is not
+ * found or there are more than one match. If the missingOK parameter is set
+ * and there are no matches, then the function returns InvalidOid.
+ */
+static Oid
+FunctionOidExtended(const char *schemaName, const char *functionName, int argumentCount,
+					bool missingOK)
+{
+	FuncCandidateList functionList = NULL;
+	Oid functionOid = InvalidOid;
+
+	char *qualifiedFunctionName = quote_qualified_identifier(schemaName, functionName);
+	List *qualifiedFunctionNameList = stringToQualifiedNameList(qualifiedFunctionName);
+	List *argumentList = NIL;
+	const bool findVariadics = false;
+	const bool findDefaults = false;
+
+	functionList = FuncnameGetCandidates(qualifiedFunctionNameList, argumentCount,
+										 argumentList, findVariadics,
+										 findDefaults, true);
+
+	if (functionList == NULL)
+	{
+		if (missingOK)
+		{
+			return InvalidOid;
+		}
+
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION),
+						errmsg("function \"%s\" does not exist", functionName)));
+	}
+	else if (functionList->next != NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+						errmsg("more than one function named \"%s\"", functionName)));
+	}
+
+	/* get function oid from function list's head */
+	functionOid = functionList->oid;
+
+	return functionOid;
+}
+
+/*
+ * FunctionCallGetTupleStore1 calls the given set-returning PGFunction with the given
+ * argument and returns the ResultSetInfo filled by the called function.
+ */
+static ReturnSetInfo *
+FunctionCallGetTupleStore1(PGFunction function, Oid functionId, Datum argument)
+{
+	LOCAL_FCINFO(fcinfo, 1);
+	FmgrInfo flinfo;
+	ReturnSetInfo *rsinfo = makeNode(ReturnSetInfo);
+	EState *estate = CreateExecutorState();
+	rsinfo->econtext = GetPerTupleExprContext(estate);
+	rsinfo->allowedModes = SFRM_Materialize;
+
+	fmgr_info(functionId, &flinfo);
+	InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, NULL, (Node *) rsinfo);
+
+	fcSetArg(fcinfo, 0, argument);
+
+	(*function)(fcinfo);
+
+	return rsinfo;
+}
+
+static Size
+ColorQueryStatsSharedMemSize(void)
+{
+	Size size;
+
+	Assert(ColorStatsMax >= 0);
+
+	size = MAXALIGN(sizeof(QueryStatsSharedState));
+	size = add_size(size, hash_estimate_size(ColorStatsMax, sizeof(QueryStatsEntry)));
+
+	return size;
+}
+
+
+
+static void
+ColorQueryStatsShmemShutdown(int code, Datum arg)
+{
+	FILE *file;
+	HASH_SEQ_STATUS hash_seq;
+	int32 num_entries;
+	QueryStatsEntry *entry;
+
+	/* Don't try to dump during a crash. */
+	if (code)
+	{
+		return;
+	}
+
+	if (!queryStats)
+	{
+		return;
+	}
+
+	file = AllocateFile(COLOR_STATS_DUMP_FILE ".tmp", PG_BINARY_W);
+	if (file == NULL)
+	{
+		goto error;
+	}
+
+	if (fwrite(&COLOR_QUERY_STATS_FILE_HEADER, sizeof(uint32), 1, file) != 1)
+	{
+		goto error;
+	}
+
+	num_entries = hash_get_num_entries(queryStatsHash);
+
+	if (fwrite(&num_entries, sizeof(int32), 1, file) != 1)
+	{
+		goto error;
+	}
+
+	hash_seq_init(&hash_seq, queryStatsHash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		if (fwrite(entry, sizeof(QueryStatsEntry), 1, file) != 1)
+		{
+			/* note: we assume hash_seq_term won't change errno */
+			hash_seq_term(&hash_seq);
+			goto error;
+		}
+	}
+
+	if (FreeFile(file))
+	{
+		file = NULL;
+		goto error;
+	}
+
+	/*
+	 * Rename file inplace
+	 */
+	if (rename(COLOR_STATS_DUMP_FILE ".tmp", COLOR_STATS_DUMP_FILE) != 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename color_query_stats file \"%s\": %m",
+						COLOR_STATS_DUMP_FILE ".tmp")));
+	}
+
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not read color_query_stats file \"%s\": %m",
+					COLOR_STATS_DUMP_FILE)));
+
+	if (file)
+	{
+		FreeFile(file);
+	}
+	unlink(COLOR_STATS_DUMP_FILE);
 }

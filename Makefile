@@ -16,3 +16,5 @@ $(EXTENSION)--1.0.sql: $(EXTENSION).sql
 	cat $^ > $@
 $(EXTENSION)--1.1.sql: $(EXTENSION)--1.0.sql $(EXTENSION)--1.0--1.1.sql
 	cat $^ > $@
+$(EXTENSION)--1.2.sql: $(EXTENSION)--1.1.sql $(EXTENSION)--1.1--1.2.sql
+	cat $^ > $@

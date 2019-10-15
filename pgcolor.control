@@ -1,5 +1,5 @@
 # pgcolor extension
 comment = 'Color data type for PostgreSQL'
-default_version = '1.1'
+default_version = '1.2'
 module_pathname = '$libdir/pgcolor'
 relocatable = true
