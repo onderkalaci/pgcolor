@@ -2,15 +2,18 @@
 #include "postgres.h"
 #include "miscadmin.h"
 
+#include "catalog/pg_type.h"
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/syscache.h"
 #include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/extensible.h"
 #include "nodes/readfuncs.h"
-
+#include "nodes/nodeFuncs.h"
+#include "optimizer/planner.h"
 
 #define ExtendedNodeName "PgColorExtendedNode"
 
@@ -109,6 +112,13 @@ const ExtensibleNodeMethods nodeMethods =
  .nodeOut = OutPgColorExtendedNode
 };
 
+static PlannedStmt * pg_color_planner(Query *parse, 
+				      int cursorOptions, 
+				      ParamListInfo boundParams);
+static Const *FetchColorInFilter(Query *query);
+static bool ExtractColorNodes(Node *node, List **colorList);
+static Oid TypeOid(Oid schemaId, const char *typeName);
+
 static void
 CopyPgColorExtendedNode(struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
 {
@@ -125,7 +135,12 @@ CopyPgColorExtendedNode(struct ExtensibleNode *target_node, const struct Extensi
 static bool
 EqualPgColorExtendedNode(const struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
 {
+	PgColorExtendedNode *targetPlan = (PgColorExtendedNode *) target_node;
+	PgColorExtendedNode *sourcePlan = (PgColorExtendedNode *) source_node;
 
+	return targetPlan->interceptedColor->r == sourcePlan->interceptedColor->r && 
+	       targetPlan->interceptedColor->g == sourcePlan->interceptedColor->g && 
+	       targetPlan->interceptedColor->b == sourcePlan->interceptedColor->b;
 }
 
 static void
@@ -155,7 +170,129 @@ ReadPgColorExtendedNode(struct ExtensibleNode *node)
 _PG_init(void)
 {
 	RegisterExtensibleNodeMethods(&nodeMethods);
+
+	planner_hook = pg_color_planner;
 }
+
+static PlannedStmt *
+pg_color_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
+{
+	PlannedStmt *standardPlan = NULL;
+	color *colorFilter = NULL;
+	Const *colorData = NULL;
+
+	standardPlan = standard_planner(parse, cursorOptions, boundParams);
+
+	colorData = FetchColorInFilter(parse);
+
+   if (colorData !=  NULL)
+   {
+	  colorFilter = DatumGetColor(colorData->constvalue);
+	  
+	  if (log_min_messages <= DEBUG4 ||
+          client_min_messages <= DEBUG4)
+        {
+        	elog(DEBUG4, "Planner intercepted the color %s", color_to_str(colorFilter));
+        }
+   }
+
+   return standardPlan;
+}
+
+
+static Const *
+FetchColorInFilter(Query *query)
+{
+	RangeTblEntry *rangeTableEntry = NULL;
+	FromExpr *joinTree = query->jointree;
+	Node *quals = NULL;
+	List *colorList  = NIL;
+
+    /* we're only interested in SELECT commands */
+	if (query->commandType != CMD_SELECT)
+	{
+		return NULL;
+	}
+
+
+	/* make sure that the only range table in FROM clause */
+	if (list_length(query->rtable) != 1)
+	{
+		return NULL;
+	}
+
+	rangeTableEntry = (RangeTblEntry *) linitial(query->rtable);
+	if (rangeTableEntry->rtekind != RTE_RELATION)
+	{
+		return NULL;
+	}
+
+	/* WHERE clause should not be empty */
+	if (joinTree == NULL || joinTree->quals == NULL)
+	{
+		return NULL;
+	}
+
+	/* convert list of expressions into expression tree for further processing */
+	quals = joinTree->quals;
+	if (quals != NULL && IsA(quals, List))
+	{
+		quals = (Node *) make_ands_explicit((List *) quals);
+	}
+
+	ExtractColorNodes(quals, &colorList);
+
+	/* we're only interested if there is a single filter */
+	if (list_length(colorList) == 1)
+	{
+		return  linitial(colorList);
+	}
+
+
+	return NULL;
+}
+
+
+static bool
+ExtractColorNodes(Node *node, List **colorList)
+{
+	bool walkerResult = false;
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Const))
+	{
+		Const *val = (Const *)  node;
+
+		if (val->consttype == TypeOid(2200, "color"))
+		{
+			*colorList = lappend(*colorList, val);
+		}
+	}
+	else
+	{
+		walkerResult = expression_tree_walker(node, ExtractColorNodes,
+				colorList);
+	}
+
+	return walkerResult;
+}
+
+
+static Oid
+TypeOid(Oid schemaId, const char *typeName)
+{
+	Oid typeOid;
+
+	typeOid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, 
+				 PointerGetDatum(typeName),
+				 ObjectIdGetDatum(schemaId));
+
+	return typeOid;
+}
+
 
 
 Datum
@@ -209,8 +346,8 @@ rgb_distance(PG_FUNCTION_ARGS)
   color *c1 = (color *) PG_GETARG_COLOR(0);
   color *c2 = (color *) PG_GETARG_COLOR(1);
 
-  if (log_min_messages <= DEBUG4 || 
-      client_min_messages <= DEBUG4)
+  if (log_min_messages <= DEBUG5 && 
+      client_min_messages <= DEBUG5)
   {
   	PgColorExtendedNode *extendedNode1 = palloc(sizeof(PgColorExtendedNode));
   	PgColorExtendedNode *extendedNode2 = palloc(sizeof(PgColorExtendedNode));
