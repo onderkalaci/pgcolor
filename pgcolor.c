@@ -14,6 +14,8 @@
 #include "nodes/readfuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
+#include "executor/tstoreReceiver.h"
+#include "utils/snapmgr.h"
 
 #define ExtendedNodeName "PgColorExtendedNode"
 
@@ -36,6 +38,16 @@ typedef struct PgColorExtendedNode
 
 	color *interceptedColor;
 } PgColorExtendedNode;
+
+typedef struct PgColorScanState
+{
+	CustomScanState customScanState;  /* underlying custom scan node */
+	PlannedStmt *plannedStatement; /* the execution plan */
+	PgColorExtendedNode *color;   						/* the color information passed to the execution */
+	uint64 queryId;
+	bool finishedScan;          /* flag to check if remote scan is finished */
+	Tuplestorestate *tuplestorestate; /* tuple store to store distributed results */
+} PgColorScanState;
 
 /* Write a Node field */
 #define WRITE_NODE_FIELD(fldname) \
@@ -119,6 +131,33 @@ static Const *FetchColorInFilter(Query *query);
 static bool ExtractColorNodes(Node *node, List **colorList);
 static Oid TypeOid(Oid schemaId, const char *typeName);
 
+static Node * PgColorCreateScan(CustomScan *scan);
+static RangeTblEntry * RemoteScanRangeTableEntry(List *columnNameList);
+static PlannedStmt * FinalizePlan(PlannedStmt *localPlan, color *interceptedColor);
+static PgColorExtendedNode * GetPgColorExtendedNode(CustomScan *customScan);
+static PlannedStmt * GetOriginalPlan(CustomScan *customScan);
+
+
+CustomScanMethods PgColorCustomScanMethods = {
+	"PGColor Scan",
+	PgColorCreateScan
+};
+
+static void PgColorBeginScan(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot * PgColorExecScan(CustomScanState *node);
+static TupleTableSlot * ReturnTupleFromTuplestore(PgColorScanState *scanState);
+static void PgColorEndScan(CustomScanState *node);
+static void PgColorReScan(CustomScanState *node);
+static EState * ScanStateGetExecutorState(PgColorScanState *scanState);
+
+static CustomExecMethods PgColorCustomExecMethods = {
+	.CustomName = "PgColorExecutorScan",
+	.BeginCustomScan = PgColorBeginScan,
+	.ExecCustomScan = PgColorExecScan,
+	.EndCustomScan = PgColorEndScan,
+	.ReScanCustomScan = PgColorReScan,
+};
+
 static void
 CopyPgColorExtendedNode(struct ExtensibleNode *target_node, const struct ExtensibleNode *source_node)
 {
@@ -172,6 +211,7 @@ _PG_init(void)
 	RegisterExtensibleNodeMethods(&nodeMethods);
 
 	planner_hook = pg_color_planner;
+
 }
 
 static PlannedStmt *
@@ -182,7 +222,7 @@ pg_color_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	Const *colorData = NULL;
 
 	standardPlan = standard_planner(parse, cursorOptions, boundParams);
-
+	
 	colorData = FetchColorInFilter(parse);
 
    if (colorData !=  NULL)
@@ -194,6 +234,9 @@ pg_color_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
         {
         	elog(DEBUG4, "Planner intercepted the color %s", color_to_str(colorFilter));
         }
+
+
+      return FinalizePlan(standardPlan, colorFilter);
    }
 
    return standardPlan;
@@ -561,4 +604,268 @@ color_ge(PG_FUNCTION_ARGS)
 	return 0;
 
 	 return 1;
+}
+
+static void
+PgColorBeginScan(CustomScanState *node, EState *estate, int eflags)
+{
+#if PG_VERSION_NUM >= 120000
+	ExecInitResultSlot(&node->ss.ps, &TTSOpsMinimalTuple);
+#endif
+}
+
+static TupleTableSlot *
+PgColorExecScan(CustomScanState *node)
+{
+	PgColorScanState *scanState = (PgColorScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedScan)
+	{
+		/*TODO: standardExecutor_Run*/
+		DestReceiver *tupleStoreDestReceiever = CreateDestReceiver(DestTuplestore);
+		EState *executorState = ScanStateGetExecutorState(scanState);
+		ParamListInfo paramListInfo = executorState->es_param_list_info;
+		QueryEnvironment *queryEnv = create_queryEnv();
+		ScanDirection scanDirection = ForwardScanDirection;
+		bool randomAccess = true;
+		bool interTransactions = false;
+
+		scanState->tuplestorestate =
+			tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
+
+		/*
+		 * Use the tupleStore provided by the scanState because it is shared accross
+		 * the other task executions and the adaptive executor.
+		 */
+		SetTuplestoreDestReceiverParams(tupleStoreDestReceiever,
+										scanState->tuplestorestate,
+										CurrentMemoryContext, false);
+
+		/* Create a QueryDesc for the query */
+		QueryDesc *queryDesc = CreateQueryDesc(scanState->plannedStatement
+											, "",
+									GetActiveSnapshot(), InvalidSnapshot,
+									tupleStoreDestReceiever, paramListInfo,
+									queryEnv, 0);
+
+		standard_ExecutorStart(queryDesc,0);
+		standard_ExecutorRun(queryDesc, scanDirection, 0L, true);
+		standard_ExecutorFinish(queryDesc);
+
+		standard_ExecutorEnd(queryDesc);
+		UnregisterSnapshot(GetActiveSnapshot());
+
+		scanState->finishedScan = true;
+	}
+
+	resultSlot = ReturnTupleFromTuplestore(scanState);
+
+
+	return resultSlot;
+}
+
+
+static TupleTableSlot *
+ReturnTupleFromTuplestore(PgColorScanState *scanState)
+{
+	Tuplestorestate *tupleStore = scanState->tuplestorestate;
+	TupleTableSlot *resultSlot = NULL;
+	EState *executorState = NULL;
+	ScanDirection scanDirection = NoMovementScanDirection;
+	bool forwardScanDirection = true;
+
+	if (tupleStore == NULL)
+	{
+		return NULL;
+	}
+
+	executorState = ScanStateGetExecutorState(scanState);
+	scanDirection = executorState->es_direction;
+	Assert(ScanDirectionIsValid(scanDirection));
+
+	if (ScanDirectionIsBackward(scanDirection))
+	{
+		forwardScanDirection = false;
+	}
+
+	resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
+	tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, resultSlot);
+
+	return resultSlot;
+}
+
+
+
+static void
+PgColorEndScan(CustomScanState *node)
+{
+	PgColorScanState *scanState = (PgColorScanState *) node;
+
+	if (scanState->tuplestorestate)
+	{
+		tuplestore_end(scanState->tuplestorestate);
+		scanState->tuplestorestate = NULL;
+	}
+	
+          if (log_min_messages <= DEBUG4 ||
+          client_min_messages <= DEBUG4)
+        {
+                elog(DEBUG4, "Executor intercepted the color %s", nodeToString(scanState->color));
+        }
+
+
+	
+}
+
+static void
+PgColorReScan(CustomScanState *node)
+{
+
+
+}
+
+static Node *
+PgColorCreateScan(CustomScan *scan)
+{
+	PgColorScanState *scanState = palloc0(sizeof(PgColorScanState));
+	PgColorExtendedNode *colorData = GetPgColorExtendedNode(scan);
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->color = colorData;
+	scanState->plannedStatement = GetOriginalPlan(scan);
+	scanState->queryId = scanState->plannedStatement->queryId;
+	scanState->customScanState.methods = &PgColorCustomExecMethods;
+
+	return (Node *) scanState;
+}
+
+
+static PgColorExtendedNode *
+GetPgColorExtendedNode(CustomScan *customScan)
+{
+	Node *node = NULL;
+	PgColorExtendedNode *color = NULL;
+
+	Assert(list_length(customScan->custom_private) == 1);
+
+	node = (Node *) linitial(customScan->custom_private);
+
+	color = (PgColorExtendedNode *) node;
+
+	return color;
+}
+
+static PlannedStmt *
+GetOriginalPlan(CustomScan *customScan)
+{
+	Node *node = NULL;
+	PlannedStmt *plan = NULL;
+
+	node = (Node *) linitial(customScan->custom_plans);
+
+	plan = (PlannedStmt *) node;
+
+	return plan;
+}
+
+
+static PlannedStmt *
+FinalizePlan(PlannedStmt *localPlan, color *interceptedColor)
+{
+	PlannedStmt *finalPlan = NULL;
+	CustomScan *customScan = makeNode(CustomScan);
+	PgColorExtendedNode *interceptedColorData = NULL;
+
+	RangeTblEntry *remoteScanRangeTableEntry = NULL;
+
+	customScan->methods = &PgColorCustomScanMethods;
+
+	interceptedColorData = palloc(sizeof(PgColorExtendedNode));
+	interceptedColorData->extensible.extnodename = ExtendedNodeName;
+	interceptedColorData->extensible.type = T_ExtensibleNode;
+	interceptedColorData->interceptedColor = interceptedColor;
+
+	customScan->custom_private = list_make1(interceptedColorData);
+	customScan->custom_plans = list_make1(localPlan);
+	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
+
+
+	/* we will have custom scan range table entry as the first one in the list */
+	int customScanRangeTableIndex = 1;
+	ListCell *targetEntryCell = NULL;
+	List *targetList = NIL;
+	List *columnNameList = NIL;
+
+	/* build a targetlist to read from the custom scan output */
+	foreach(targetEntryCell, localPlan->planTree->targetlist)
+	{
+		TargetEntry *targetEntry = lfirst(targetEntryCell);
+		TargetEntry *newTargetEntry = NULL;
+		Var *newVar = NULL;
+		Value *columnName = NULL;
+
+		Assert(IsA(targetEntry, TargetEntry));
+
+		/*
+		 * This is unlikely to be hit because we would not need resjunk stuff
+		 * at the toplevel of a router query - all things needing it have been
+		 * pushed down.
+		 */
+		if (targetEntry->resjunk)
+		{
+			continue;
+		}
+
+		/* build target entry pointing to remote scan range table entry */
+		newVar = makeVarFromTargetEntry(customScanRangeTableIndex, targetEntry);
+
+		newTargetEntry = flatCopyTargetEntry(targetEntry);
+		newTargetEntry->expr = (Expr *) newVar;
+		targetList = lappend(targetList, newTargetEntry);
+
+		columnName = makeString(targetEntry->resname);
+		columnNameList = lappend(columnNameList, columnName);
+	}
+
+	customScan->scan.plan.targetlist = targetList;
+
+	finalPlan = makeNode(PlannedStmt);
+	finalPlan->planTree = (Plan *) customScan;
+
+		finalPlan->canSetTag = true;
+	finalPlan->relationOids = NIL;
+
+	finalPlan->queryId = localPlan->queryId;
+	finalPlan->utilityStmt = localPlan->utilityStmt;
+	finalPlan->commandType = localPlan->commandType;
+	finalPlan->hasReturning = localPlan->hasReturning;
+
+
+	remoteScanRangeTableEntry = RemoteScanRangeTableEntry(columnNameList);
+	finalPlan->rtable = list_make1(remoteScanRangeTableEntry);
+
+
+	return finalPlan;
+}
+
+
+
+static RangeTblEntry *
+RemoteScanRangeTableEntry(List *columnNameList)
+{
+	RangeTblEntry *remoteScanRangeTableEntry = makeNode(RangeTblEntry);
+
+	/* we use RTE_VALUES for custom scan because we can't look up relation */
+	remoteScanRangeTableEntry->rtekind = RTE_VALUES;
+	remoteScanRangeTableEntry->eref = makeAlias("remote_scan", columnNameList);
+	remoteScanRangeTableEntry->inh = false;
+	remoteScanRangeTableEntry->inFromCl = true;
+
+	return remoteScanRangeTableEntry;
+}
+
+static EState *
+ScanStateGetExecutorState(PgColorScanState *scanState)
+{
+	return scanState->customScanState.ss.ps.state;
 }
